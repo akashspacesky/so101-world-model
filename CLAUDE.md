@@ -2,14 +2,14 @@
 
 ## What This Is
 
-A 1X-style world model for SO-101 robots. Given a current camera frame and a text instruction, it:
+A world-model-as-policy system for SO-101 robots. Given a current camera frame and a text instruction, it:
 1. Generates a plausible future video of the task being completed (world model)
 2. Extracts SO-101 joint actions from consecutive frame pairs (inverse dynamics model)
 3. Executes the actions on the robot
 
 Training data: all public SO-101/SO-100 datasets on HuggingFace + accumulated deployment data (flywheel).
 
-**Paper inspiration**: [1X World Model](https://www.1x.tech/discover/world-model-self-learning)
+**Core idea**: World models as zero-shot robot policies — generate a plausible future video of task completion, then use an inverse dynamics model to extract executable actions. See NVIDIA Cosmos and related work on video-generative world models for physical AI.
 
 ---
 
