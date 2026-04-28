@@ -1,0 +1,67 @@
+# so101-world-model default configuration
+
+# IDM model
+idm:
+  action_dim: 6          # SO-101: 6 DoF joints
+  feature_dim: 768       # DINOv2-B output dim
+  hidden_dim: 512
+  num_layers: 3
+  num_heads: 8
+  dropout: 0.1
+  freeze_encoder: true   # Keep DINOv2 frozen during IDM training
+  encoder_model_id: "facebook/dinov2-base"
+
+# World model
+world_model:
+  model_id: "THUDM/CogVideoX-2b"
+  lora_rank: 128
+  lora_alpha: 128
+  num_frames: 13         # Frames to generate per planning step (~1.6s at 8fps)
+  inference_steps: 50
+  guidance_scale: 6.0
+
+# IDM training
+idm_training:
+  epochs: 50
+  batch_size: 128
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  val_split: 0.05
+  device: "cuda"
+  num_workers: 4
+  log_every: 50
+  save_every: 5
+
+# World model training (cloud)
+wm_training:
+  epochs: 10
+  batch_size: 1          # 1-2 on A100 40GB
+  gradient_accumulation: 4
+  lr: 2.0e-4
+  weight_decay: 1.0e-3
+  grad_clip: 1.0
+  mixed_precision: "bf16"
+  clip_len: 13
+  stride: 2
+  device: "cuda"
+  num_workers: 2
+
+# Inference / planning
+inference:
+  num_candidates: 3      # Test-time compute scaling (more = better but slower)
+  use_clip_scoring: true
+  replan_every: 6        # Re-plan every N robot steps with fresh camera frame
+  max_steps: 50
+
+# Data flywheel
+flywheel:
+  hf_repo: "so101-community/world-model-data"
+  success_threshold: 0.25   # CLIP score threshold for auto-labeling success
+  auto_upload: true
+
+# Data paths
+data:
+  raw_dir: "data/raw"
+  cache_dir: "data/cache"
+  checkpoint_dir: "checkpoints"
