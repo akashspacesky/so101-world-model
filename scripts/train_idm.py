@@ -12,7 +12,7 @@ def main():
     parser.add_argument("--data_dir", type=Path, default=Path("data/raw"), help="Downloaded SO-101 data root")
     parser.add_argument("--output_dir", type=Path, default=Path("checkpoints/idm"))
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--device", default="cuda", choices=["cuda", "mps", "cpu"])
     parser.add_argument("--freeze_encoder", action="store_true", default=True)

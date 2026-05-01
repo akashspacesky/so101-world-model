@@ -35,7 +35,7 @@ def train_idm(
     freeze_encoder: bool = True,
     # Training
     epochs: int = 50,
-    batch_size: int = 128,
+    batch_size: int = 64,
     lr: float = 3e-4,
     weight_decay: float = 1e-4,
     grad_clip: float = 1.0,
