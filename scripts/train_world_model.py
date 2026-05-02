@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 
-DIFFUSERS_TRAIN_SCRIPT = "https://raw.githubusercontent.com/huggingface/diffusers/main/examples/cogvideo/train_cogvideox_lora.py"
+DIFFUSERS_TRAIN_SCRIPT = "https://raw.githubusercontent.com/huggingface/diffusers/v0.32.2/examples/cogvideo/train_cogvideox_lora.py"
 
 
 def download_train_script(dest: Path) -> Path:
