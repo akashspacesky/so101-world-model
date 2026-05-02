@@ -80,7 +80,6 @@ def main():
         "--gradient_checkpointing",
         "--enable_slicing",
         "--enable_tiling",
-        "--report_to", "none",
         "--seed", "42",
     ]
 
