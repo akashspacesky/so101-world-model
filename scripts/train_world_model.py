@@ -48,11 +48,10 @@ def main():
     parser.add_argument("--mixed_precision", default="bf16", choices=["no", "fp16", "bf16"])
     args = parser.parse_args()
 
-    csv_path = args.data_dir / "metadata.csv"
-    if not csv_path.exists():
-        print(f"ERROR: metadata.csv not found at {csv_path}")
-        print("Run export_videos.py first:")
-        print("  python scripts/export_videos.py --data_dir /workspace/data/raw --output_dir /workspace/data/videos")
+    videos_dir = args.data_dir / "videos"
+    if not videos_dir.exists():
+        print(f"ERROR: videos dir not found at {videos_dir}")
+        print("Run first: python scripts/export_videos.py --data_dir /workspace/data/raw --output_dir /workspace/data/videos")
         sys.exit(1)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -65,9 +64,7 @@ def main():
         sys.executable, str(script_path),
         "--pretrained_model_name_or_path", args.model_id,
         "--instance_data_root", str(args.data_dir / "videos"),
-        "--dataset_name", str(csv_path),
-        "--video_column", "video",
-        "--caption_column", "caption",
+        "--instance_prompt", "SO-101 robot arm manipulation task",
         "--output_dir", str(args.output_dir),
         "--mixed_precision", args.mixed_precision,
         "--num_train_epochs", str(args.epochs),
