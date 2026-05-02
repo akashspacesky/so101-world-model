@@ -65,8 +65,9 @@ def main():
         sys.executable, str(script_path),
         "--pretrained_model_name_or_path", args.model_id,
         "--instance_data_root", str(args.data_dir / "videos"),
-        "--instance_prompt", "SO-101 robot manipulation",  # base prompt, overridden per-video by metadata
         "--dataset_name", str(csv_path),
+        "--video_column", "video",
+        "--caption_column", "caption",
         "--output_dir", str(args.output_dir),
         "--mixed_precision", args.mixed_precision,
         "--num_train_epochs", str(args.epochs),
