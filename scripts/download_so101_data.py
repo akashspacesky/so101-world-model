@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--output_dir", type=Path, default=Path("data/raw"))
     parser.add_argument("--scan", action="store_true", help="Preview without downloading")
     parser.add_argument("--force", action="store_true", help="Re-download cached datasets")
+    parser.add_argument("--workers", type=int, default=4, help="Parallel download workers")
     args = parser.parse_args()
 
     datasets = search_hub_datasets()
@@ -29,7 +30,7 @@ def main():
     if args.scan:
         return
 
-    download_all(args.output_dir, datasets=datasets, force=args.force)
+    download_all(args.output_dir, datasets=datasets, force=args.force, workers=args.workers)
 
 
 if __name__ == "__main__":

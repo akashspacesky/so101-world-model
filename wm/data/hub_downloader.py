@@ -1,29 +1,37 @@
 """
 Download SO-101 / SO-100 robot datasets from HuggingFace.
 
-Search strategy:
-  1. Enumerate all datasets tagged "lerobot" + keyword search for so101/so100
-  2. Filter by repo name / tags — no per-repo API calls (fast)
-  3. Download everything that matches; quality filtering happens in the dataloader
+Strategy:
+  1. Scan: one API call per search term to find all matching repos
+  2. Per repo: one API call (list_repo_files) to get the file list
+  3. Download: parallel direct GET requests — no per-file HEAD/ETag checks
 
-Run `python scripts/download_so101_data.py --scan` to preview without downloading.
+snapshot_download() HEAD-checks every file against local ETags before
+downloading. For v3 datasets with 10k individual frame files that means
+10k HEAD requests → 429s. Direct GETs to HF's CDN bypass this entirely.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import time
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Iterator
 
-from huggingface_hub import HfApi, snapshot_download
+import requests
+from huggingface_hub import HfApi, hf_hub_url
 from tqdm import tqdm
 
 
 SO101_KEYWORDS = ["so101", "so-101"]
 SO100_KEYWORDS = ["so100", "so-100"]
 ALL_KEYWORDS = SO101_KEYWORDS + SO100_KEYWORDS
+
+_SKIP = {".gitattributes", ".gitignore", ".git"}
 
 
 @dataclass
@@ -32,6 +40,10 @@ class DatasetInfo:
     robot_type: str
     local_path: Path | None = None
 
+
+# ---------------------------------------------------------------------------
+# Hub scanning
+# ---------------------------------------------------------------------------
 
 def _api_call_with_retry(fn, retries: int = 4, **kwargs) -> list:
     for attempt in range(retries):
@@ -49,22 +61,16 @@ def _api_call_with_retry(fn, retries: int = 4, **kwargs) -> list:
 
 
 def search_hub_datasets(verbose: bool = True) -> list[DatasetInfo]:
-    """
-    Fast scan: one API call per search term, no per-repo lookups.
-    Returns all SO-101/SO-100 datasets found on HuggingFace.
-    """
     api = HfApi()
     found: dict[str, DatasetInfo] = {}
 
     if verbose:
         print("Scanning HuggingFace Hub for SO-101/SO-100 datasets...")
 
-    # All lerobot-tagged datasets (catches the community explosion)
     lerobot_ds = _api_call_with_retry(api.list_datasets, filter="lerobot", limit=5000)
     if verbose:
         print(f"  {len(lerobot_ds)} datasets tagged 'lerobot'")
 
-    # Direct keyword search for so101/so100 (catches untagged datasets)
     keyword_ds: list = []
     for kw in ALL_KEYWORDS:
         keyword_ds += _api_call_with_retry(api.list_datasets, search=kw, limit=2000)
@@ -99,42 +105,98 @@ def _infer_robot_type(repo_id: str, tags: list[str]) -> str:
 def print_scan_report(datasets: list[DatasetInfo]) -> None:
     so101 = [d for d in datasets if d.robot_type == "so101"]
     so100 = [d for d in datasets if d.robot_type == "so100"]
-
     print(f"\n{'='*60}")
-    print(f"SCAN RESULTS  (no per-repo API calls — size unknown until download)")
+    print(f"SCAN RESULTS  (size unknown until download)")
     print(f"{'='*60}")
-    print(f"  Total datasets found: {len(datasets):>5}")
-    print(f"  SO-101:               {len(so101):>5}")
-    print(f"  SO-100:               {len(so100):>5}")
+    print(f"  Total: {len(datasets):>5}   SO-101: {len(so101):>5}   SO-100: {len(so100):>5}")
     print(f"{'='*60}")
-    print(f"\nSample datasets:")
     for d in datasets[:30]:
         print(f"  {d.repo_id:<60}  [{d.robot_type}]")
     if len(datasets) > 30:
         print(f"  ... and {len(datasets) - 30} more")
 
 
-def download_dataset(repo_id: str, output_dir: Path, force: bool = False) -> Path:
+# ---------------------------------------------------------------------------
+# Direct GET download (no HEAD / ETag check)
+# ---------------------------------------------------------------------------
+
+def _download_file(url: str, local_path: Path, token: str | None, retries: int = 6) -> None:
+    if local_path.exists():
+        return
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+    for attempt in range(retries):
+        try:
+            with requests.get(url, headers=headers, stream=True, timeout=120) as r:
+                if r.status_code == 429:
+                    wait = 15 * (2 ** attempt)
+                    time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                tmp = local_path.with_suffix(local_path.suffix + ".tmp")
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        f.write(chunk)
+                tmp.rename(local_path)
+                return
+        except requests.RequestException:
+            if attempt == retries - 1:
+                raise
+            time.sleep(5 * (attempt + 1))
+
+
+def download_dataset(
+    repo_id: str,
+    output_dir: Path,
+    force: bool = False,
+    file_workers: int = 8,
+) -> Path:
+    """
+    Download one dataset.
+    - 1 API call to list all files
+    - Parallel direct GET downloads, no per-file HEAD requests
+    """
     local_path = output_dir / repo_id.replace("/", "__")
     if local_path.exists() and not force:
         return local_path
-    snapshot_download(
-        repo_id=repo_id,
-        repo_type="dataset",
-        local_dir=str(local_path),
-        ignore_patterns=[
-            "*.git*", "*.gitattributes",
-            # Video files — can't decode without ffmpeg/av, skip entirely
-            "*.mp4", "*.avi", "*.mov", "*.mkv", "*.webm",
-        ],
-    )
+
+    token = os.environ.get("HF_TOKEN")
+    api = HfApi(token=token)
+
+    # Single API call — replaces N HEAD requests
+    try:
+        all_files = list(api.list_repo_files(repo_id, repo_type="dataset"))
+    except Exception as e:
+        raise RuntimeError(f"Cannot list {repo_id}: {e}")
+
+    files = [
+        f for f in all_files
+        if Path(f).name not in _SKIP and not f.startswith(".git")
+    ]
+
+    def _fetch(file_path: str) -> None:
+        url = hf_hub_url(repo_id=repo_id, filename=file_path, repo_type="dataset")
+        _download_file(url, local_path / file_path, token)
+
+    with ThreadPoolExecutor(max_workers=file_workers) as pool:
+        futures = [pool.submit(_fetch, f) for f in files]
+        for future in as_completed(futures):
+            future.result()
+
     return local_path
 
+
+# ---------------------------------------------------------------------------
+# Bulk download across all datasets
+# ---------------------------------------------------------------------------
 
 def download_all(
     output_dir: Path,
     datasets: list[DatasetInfo] | None = None,
     force: bool = False,
+    workers: int = 4,
+    file_workers: int = 8,
 ) -> list[DatasetInfo]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -143,12 +205,28 @@ def download_all(
         print_scan_report(datasets)
 
     print(f"\nDownloading {len(datasets)} datasets → {output_dir}")
+    print(f"  {workers} dataset workers × {file_workers} file workers = {workers*file_workers} concurrent GETs")
 
-    for info in tqdm(datasets, desc="Downloading"):
+    lock = Lock()
+    pbar = tqdm(total=len(datasets), desc="Datasets")
+
+    def _download_one(info: DatasetInfo) -> DatasetInfo:
         try:
-            info.local_path = download_dataset(info.repo_id, output_dir, force=force)
+            info.local_path = download_dataset(
+                info.repo_id, output_dir, force=force, file_workers=file_workers
+            )
         except Exception as e:
-            print(f"  WARNING: {info.repo_id}: {e}")
+            print(f"\n  WARNING: {info.repo_id}: {e}")
+        with lock:
+            pbar.update(1)
+        return info
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_download_one, info): info for info in datasets}
+        for future in as_completed(futures):
+            future.result()
+
+    pbar.close()
 
     registry = [
         {"repo_id": d.repo_id, "robot_type": d.robot_type,
@@ -164,12 +242,16 @@ def download_all(
     return datasets
 
 
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
 def iter_episode_files(data_dir: Path) -> Iterator[Path]:
-    yield from sorted(data_dir.rglob("episode_*.parquet"))
+    yield from sorted(Path(data_dir).rglob("episode_*.parquet"))
 
 
 def load_registry(data_dir: Path) -> list[DatasetInfo]:
-    registry_path = data_dir / "registry.json"
+    registry_path = Path(data_dir) / "registry.json"
     if not registry_path.exists():
         return []
     return [

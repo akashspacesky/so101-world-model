@@ -46,6 +46,8 @@ def train_idm(
     log_every: int = 50,
     save_every: int = 5,
     max_episodes: int | None = None,
+    min_frames: int = 50,
+    quality_filter: bool = True,
     wandb_project: str | None = None,
 ) -> None:
     output_dir = Path(output_dir)
@@ -66,7 +68,7 @@ def train_idm(
     print(f"Device: {device}")
     print(f"Loading dataset from {data_dir}")
 
-    dataset = IDMDataset(data_dir, max_episodes=max_episodes)
+    dataset = IDMDataset(data_dir, max_episodes=max_episodes, min_frames=min_frames, quality_filter=quality_filter)
     if len(dataset) == 0:
         raise RuntimeError(f"No frame pairs found in {data_dir}. Run download_so101_data.py first.")
 

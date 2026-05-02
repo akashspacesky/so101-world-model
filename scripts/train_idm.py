@@ -17,6 +17,9 @@ def main():
     parser.add_argument("--device", default="cuda", choices=["cuda", "mps", "cpu"])
     parser.add_argument("--freeze_encoder", action="store_true", default=True)
     parser.add_argument("--max_episodes", type=int, default=None, help="Limit for quick runs")
+    parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers")
+    parser.add_argument("--min_frames", type=int, default=50, help="Min frames per episode")
+    parser.add_argument("--no_quality_filter", action="store_true", help="Disable junk repo filter")
     parser.add_argument("--wandb", default=None, metavar="PROJECT", help="WandB project name")
     args = parser.parse_args()
 
@@ -29,6 +32,9 @@ def main():
         device=args.device,
         freeze_encoder=args.freeze_encoder,
         max_episodes=args.max_episodes,
+        num_workers=args.num_workers,
+        min_frames=args.min_frames,
+        quality_filter=not args.no_quality_filter,
         wandb_project=args.wandb,
     )
 

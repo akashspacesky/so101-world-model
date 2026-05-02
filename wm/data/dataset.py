@@ -14,8 +14,9 @@ Design: fully lazy — images loaded from disk in __getitem__, not at init.
 from __future__ import annotations
 
 import functools
-import io
 import json
+import re
+from collections import defaultdict
 from pathlib import Path
 from typing import Callable
 
@@ -35,11 +36,36 @@ from wm.data.preprocessor import (
 
 ACTION_DIM = 6  # SO-101 / SO-100 are both 6 DoF
 
+# Repo names matching these patterns are junk (test uploads, personal experiments)
+_JUNK_RE = re.compile(
+    r'(?:^|[-_])test\d*$'
+    r'|(?:^|[-_])trial\d*$'
+    r'|(?:^|[-_])debug\d*$'
+    r'|(?:^|[-_])tmp\d*$'
+    r'|(?:^|[-_])temp\d*$'
+    r'|(?:^|[-_])demo\d*$'
+    r'|(?:^|[-_])exp\d*$',
+    re.IGNORECASE,
+)
+
+_VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+
+
+def _is_quality_repo(dataset_dir_name: str) -> bool:
+    """
+    Filter based on the local directory name (encodes repo_id as user__dataset).
+    Returns False for obvious junk repos (test uploads, personal experiments).
+    """
+    parts = dataset_dir_name.split("__", 1)
+    name = parts[-1] if len(parts) > 1 else dataset_dir_name
+    return not _JUNK_RE.search(name)
+
 
 def _find_image_columns(df: pd.DataFrame) -> list[str]:
     return [
         c for c in df.columns
-        if "image" in c.lower() or "camera" in c.lower() or "observation.images" in c.lower()
+        if any(kw in c.lower() for kw in ("image", "camera", "video", "rgb", "pixel", "frame", "obs"))
+        and "action" not in c.lower()
     ]
 
 
@@ -70,21 +96,12 @@ def _extract_action(row_value) -> np.ndarray | None:
 
 
 def _decode_image_cell(cell, base_dir: Path | None = None) -> Image.Image | None:
-    """
-    Decode one parquet image cell. Handles three formats:
-      - bytes / bytearray: raw image bytes (v1/v2)
-      - dict with 'bytes': {'bytes': b'...', 'path': '...'} (v2)
-      - dict with 'path' only: {'path': 'episode_0/cam_0/000001.jpg'} (v3)
-        → resolves path relative to base_dir (dataset root)
-    """
     if cell is None:
         return None
     try:
         if isinstance(cell, dict):
-            # v2: bytes embedded in dict
             if "bytes" in cell and cell["bytes"] is not None:
                 return decode_image(cell["bytes"])
-            # v3: path-only, load from disk
             if "path" in cell and cell["path"] and base_dir is not None:
                 img_path = base_dir / cell["path"]
                 if img_path.exists():
@@ -104,11 +121,6 @@ def _decode_image_cell(cell, base_dir: Path | None = None) -> Image.Image | None
 
 
 def _dataset_root(parquet_path: Path) -> Path:
-    """
-    Infer dataset root from parquet path.
-    LeRobot stores parquets in <root>/data/episode_*.parquet
-    so root = parquet.parent.parent
-    """
     return parquet_path.parent.parent
 
 
@@ -119,45 +131,73 @@ def _dataset_root(parquet_path: Path) -> Path:
 class _EpisodeIndex:
     """
     Scans all parquet files and builds a flat index of valid frame pairs.
-    Each entry: (parquet_path, dataset_root, row_i, row_j, img_col, action_col)
+
+    Two-stage quality filter:
+      1. Repo name filter (no I/O) — drops test/debug/junk repos instantly
+      2. Episode filter — drops episodes with fewer than min_frames frames
     """
 
-    def __init__(self, data_dir: Path, max_episodes: int | None = None):
+    def __init__(
+        self,
+        data_dir: Path,
+        max_episodes: int | None = None,
+        min_frames: int = 50,
+        quality_filter: bool = True,
+    ):
         self.entries: list[tuple[Path, Path, int, int, str, str | None]] = []
 
-        parquet_files = sorted(Path(data_dir).rglob("episode_*.parquet"))
+        all_parquets = sorted(Path(data_dir).rglob("episode_*.parquet"))
+
+        # Group by dataset dir so we can apply repo-level filter once per repo
+        by_dataset: dict[Path, list[Path]] = defaultdict(list)
+        for pf in all_parquets:
+            by_dataset[_dataset_root(pf)].append(pf)
+
+        if quality_filter:
+            kept = {d: pfs for d, pfs in by_dataset.items() if _is_quality_repo(d.name)}
+            n_junk = len(by_dataset) - len(kept)
+        else:
+            kept = dict(by_dataset)
+            n_junk = 0
+
+        parquet_files = sorted(pf for pfs in kept.values() for pf in pfs)
         if max_episodes:
             parquet_files = parquet_files[:max_episodes]
 
-        print(f"Indexing {len(parquet_files)} episode files...")
+        print(f"Indexing {len(parquet_files)} episodes from {len(kept)} datasets")
+        if quality_filter:
+            print(f"  ({n_junk} junk repos filtered by name)")
+
         skipped = 0
         for pf in parquet_files:
             try:
-                n = self._index_file(pf)
+                n = self._index_file(pf, min_frames=min_frames)
                 if n == 0:
                     skipped += 1
             except Exception:
                 skipped += 1
 
-        print(f"  {len(self.entries):,} frame pairs indexed  ({skipped} episodes skipped)")
+        print(f"  {len(self.entries):,} frame pairs indexed")
+        print(f"  {skipped} episodes skipped (short / bad format / video-only)")
 
-    def _index_file(self, pf: Path) -> int:
+    def _index_file(self, pf: Path, min_frames: int = 50) -> int:
         df = pd.read_parquet(pf)
+        if len(df) < min_frames:
+            return 0
         img_cols = _find_image_columns(df)
-        if not img_cols or len(df) < 2:
+        if not img_cols:
             return 0
         img_col = img_cols[0]
 
-        # Detect format from first cell
         sample = df[img_col].iloc[0]
         if sample is None:
             return 0
 
-        # v1/v2 bytes — fine
-        # v3 path-only — also fine, we resolve at __getitem__ time
-        # Only skip if we have no idea what the cell is
-        if isinstance(sample, dict) and "bytes" not in sample and "path" not in sample:
-            return 0
+        if isinstance(sample, dict):
+            if "bytes" not in sample and "path" not in sample:
+                return 0
+            if "path" in sample and sample["path"] and Path(sample["path"]).suffix.lower() in _VIDEO_EXTS:
+                return 0
 
         root = _dataset_root(pf)
         action_col = _find_action_column(df)
@@ -172,7 +212,7 @@ class _EpisodeIndex:
 # Parquet LRU cache
 # ---------------------------------------------------------------------------
 
-@functools.lru_cache(maxsize=64)
+@functools.lru_cache(maxsize=16)
 def _cached_parquet(path_str: str) -> pd.DataFrame:
     return pd.read_parquet(path_str)
 
@@ -192,9 +232,16 @@ class IDMDataset(Dataset):
         data_dir: Path,
         transform: Callable | None = None,
         max_episodes: int | None = None,
+        min_frames: int = 50,
+        quality_filter: bool = True,
     ):
         self.transform = transform or make_dino_transform()
-        self.index = _EpisodeIndex(data_dir, max_episodes=max_episodes)
+        self.index = _EpisodeIndex(
+            data_dir,
+            max_episodes=max_episodes,
+            min_frames=min_frames,
+            quality_filter=quality_filter,
+        )
 
     def __len__(self) -> int:
         return len(self.index.entries)
@@ -239,23 +286,36 @@ class WorldModelDataset(Dataset):
         stride: int = 2,
         transform: Callable | None = None,
         max_episodes: int | None = None,
+        min_frames: int = 50,
+        quality_filter: bool = True,
     ):
         self.clip_len = clip_len
         self.stride = stride
         self.transform = transform or make_wm_transform()
-        self.valid_files: list[tuple[Path, Path, str, str]] = []  # (pf, root, img_col, task)
+        self.valid_files: list[tuple[Path, Path, str, str]] = []
 
-        parquet_files = sorted(Path(data_dir).rglob("episode_*.parquet"))
+        all_parquets = sorted(Path(data_dir).rglob("episode_*.parquet"))
+
+        by_dataset: dict[Path, list[Path]] = defaultdict(list)
+        for pf in all_parquets:
+            by_dataset[_dataset_root(pf)].append(pf)
+
+        if quality_filter:
+            kept = {d: pfs for d, pfs in by_dataset.items() if _is_quality_repo(d.name)}
+        else:
+            kept = dict(by_dataset)
+
+        parquet_files = sorted(pf for pfs in kept.values() for pf in pfs)
         if max_episodes:
             parquet_files = parquet_files[:max_episodes]
 
-        min_frames = clip_len * stride
+        required_frames = max(clip_len * stride, min_frames)
         print(f"WorldModelDataset: scanning {len(parquet_files)} episodes...")
         for pf in parquet_files:
             try:
                 df = pd.read_parquet(pf)
                 img_cols = _find_image_columns(df)
-                if not img_cols or len(df) < min_frames:
+                if not img_cols or len(df) < required_frames:
                     continue
                 task = _infer_task(df, pf)
                 self.valid_files.append((pf, _dataset_root(pf), img_cols[0], task))
